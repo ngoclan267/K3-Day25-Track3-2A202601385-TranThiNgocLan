@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +55,7 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self.false_hit_log: list[dict[str, object]] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
         """Look up a cached response by semantic similarity.
@@ -70,7 +73,27 @@ class ResponseCache:
         You'll need a self.false_hit_log: list[dict[str, object]] attribute
         (add it in __init__).
         """
-        raise NotImplementedError("TODO: implement get()")
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        now = time.time()
+        self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
+
+        best_score = 0.0
+        best_entry = None
+        for entry in self._entries:
+            score = self.similarity(query, entry.key)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        if best_entry and best_score >= self.similarity_threshold:
+            if _looks_like_false_hit(query, best_entry.key):
+                self.false_hit_log.append({"query": query, "cached_key": best_entry.key, "score": best_score, "reason": "date_or_number_mismatch"})
+                return None, best_score
+            return best_entry.value, best_score
+
+        return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in cache.
@@ -79,7 +102,14 @@ class ResponseCache:
         1. Return immediately if _is_uncacheable(query)
         2. Append a CacheEntry to self._entries
         """
-        raise NotImplementedError("TODO: implement set()")
+        if _is_uncacheable(query):
+            return
+        self._entries.append(CacheEntry(
+            key=query,
+            value=value,
+            created_at=time.time(),
+            metadata=metadata or {}
+        ))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
@@ -98,7 +128,35 @@ class ResponseCache:
         Hint: Use collections.Counter and math.sqrt.
         Import them at the top of the file.
         """
-        raise NotImplementedError("TODO: implement similarity()")
+        if a == b:
+            return 1.0
+
+        def tokenize(s: str) -> list[str]:
+            tokens = s.lower().split()
+            ngrams = []
+            for token in tokens:
+                ngrams.append(token)
+                for i in range(len(token) - 2):
+                    ngrams.append(token[i:i+3])
+            return ngrams
+
+        tokens_a = tokenize(a)
+        tokens_b = tokenize(b)
+
+        if not tokens_a or not tokens_b:
+            return 0.0
+
+        counter_a = Counter(tokens_a)
+        counter_b = Counter(tokens_b)
+
+        dot_product = sum(counter_a[token] * counter_b[token] for token in counter_a if token in counter_b)
+        mag_a = math.sqrt(sum(v*v for v in counter_a.values()))
+        mag_b = math.sqrt(sum(v*v for v in counter_b.values()))
+
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+
+        return dot_product / (mag_a * mag_b)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +221,35 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        exact_key = f"{self.prefix}{self._query_hash(query)}"
+        exact_response = self._redis.hget(exact_key, "response")
+        if exact_response:
+            return exact_response, 1.0
+
+        best_score = 0.0
+        best_value = None
+        best_cached_key = None
+
+        for key in self._redis.scan_iter(f"{self.prefix}*"):
+            cached_query = self._redis.hget(key, "query")
+            if not cached_query:
+                continue
+            score = ResponseCache.similarity(query, cached_query)
+            if score > best_score:
+                best_score = score
+                best_value = self._redis.hget(key, "response")
+                best_cached_key = cached_query
+
+        if best_value and best_score >= self.similarity_threshold:
+            if best_cached_key and _looks_like_false_hit(query, best_cached_key):
+                self.false_hit_log.append({"query": query, "cached_key": best_cached_key, "score": best_score, "reason": "date_or_number_mismatch"})
+                return None, best_score
+            return best_value, best_score
+
+        return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -174,7 +260,11 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+        key = f"{self.prefix}{self._query_hash(query)}"
+        self._redis.hset(key, mapping={"query": query, "response": value})
+        self._redis.expire(key, self.ttl_seconds)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
